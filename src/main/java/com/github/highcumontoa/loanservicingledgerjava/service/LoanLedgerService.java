@@ -4,9 +4,12 @@ import com.github.highcumontoa.loanservicingledgerjava.config.LedgerProperties;
 import com.github.highcumontoa.loanservicingledgerjava.domain.Installment;
 import com.github.highcumontoa.loanservicingledgerjava.domain.InstallmentStatus;
 import com.github.highcumontoa.loanservicingledgerjava.domain.Loan;
+import com.github.highcumontoa.loanservicingledgerjava.domain.LoanRules;
 import com.github.highcumontoa.loanservicingledgerjava.domain.LoanStatus;
 import com.github.highcumontoa.loanservicingledgerjava.domain.Payment;
 import com.github.highcumontoa.loanservicingledgerjava.domain.PaymentAllocation;
+import com.github.highcumontoa.loanservicingledgerjava.domain.WaiverEntry;
+import com.github.highcumontoa.loanservicingledgerjava.domain.reconciliation.ReconciliationReport;
 import com.github.highcumontoa.loanservicingledgerjava.error.LedgerErrorCode;
 import com.github.highcumontoa.loanservicingledgerjava.error.LedgerException;
 import java.math.BigDecimal;
@@ -38,6 +41,7 @@ public class LoanLedgerService {
 
     private final AmortizationCalculator calculator;
     private final LedgerProperties properties;
+    private final Reconciler reconciler;
 
     private final Map<String, Loan> loans = new ConcurrentHashMap<>();
     private final Map<String, Object> locks = new ConcurrentHashMap<>();
@@ -45,13 +49,36 @@ public class LoanLedgerService {
     private final Map<String, Map<String, Payment>> idempotencyIndex = new ConcurrentHashMap<>();
 
     public LoanLedgerService(AmortizationCalculator calculator, LedgerProperties properties) {
-        this.calculator = calculator;
-        this.properties = properties;
+        this(calculator, properties, new Reconciler());
     }
 
-    /** 发放贷款并生成摊销计划。 */
+    @org.springframework.beans.factory.annotation.Autowired
+    public LoanLedgerService(AmortizationCalculator calculator, LedgerProperties properties,
+                             Reconciler reconciler) {
+        this.calculator = calculator;
+        this.properties = properties;
+        this.reconciler = reconciler;
+    }
+
+    /** 发放贷款（逾期口径沿用全局默认）并生成摊销计划。 */
     public Loan disburse(String loanId, BigDecimal principal, BigDecimal annualRate,
                          int termMonths, LocalDate disbursementDate, BigDecimal monthlyFee) {
+        return disburse(loanId, principal, annualRate, termMonths, disbursementDate,
+                monthlyFee, null, null);
+    }
+
+    /**
+     * 发放贷款并生成摊销计划。
+     *
+     * @param customGracePeriodDays 本笔贷款单独指定的宽限期天数；null 沿用全局默认
+     * @param customPenaltyDailyRate 本笔贷款单独指定的罚息日利率；null 沿用全局默认
+     *
+     * <p>规则在放款当时固化：传入 null 的项取<b>当前</b>全局默认快照，
+     * 之后全局默认如何修改都不再影响本笔贷款的逾期判定与罚息。
+     */
+    public Loan disburse(String loanId, BigDecimal principal, BigDecimal annualRate,
+                         int termMonths, LocalDate disbursementDate, BigDecimal monthlyFee,
+                         Integer customGracePeriodDays, BigDecimal customPenaltyDailyRate) {
         if (loanId == null || loanId.isBlank()
                 || principal == null || principal.signum() <= 0
                 || annualRate == null || annualRate.signum() < 0
@@ -60,16 +87,33 @@ public class LoanLedgerService {
                     "非法放款参数: loanId=" + loanId + ", principal=" + principal
                             + ", annualRate=" + annualRate + ", termMonths=" + termMonths);
         }
+        if (customGracePeriodDays != null && customGracePeriodDays < 0) {
+            throw new LedgerException(LedgerErrorCode.INVALID_DISBURSEMENT,
+                    "宽限期天数不能为负: " + customGracePeriodDays);
+        }
+        if (customPenaltyDailyRate != null && customPenaltyDailyRate.signum() < 0) {
+            throw new LedgerException(LedgerErrorCode.INVALID_DISBURSEMENT,
+                    "罚息日利率不能为负: " + customPenaltyDailyRate);
+        }
         Object lock = locks.computeIfAbsent(loanId, k -> new Object());
         synchronized (lock) {
             if (loans.containsKey(loanId)) {
                 throw new LedgerException(LedgerErrorCode.INVALID_DISBURSEMENT,
                         "贷款已存在: " + loanId);
             }
+            // 放款当时固化逾期口径：未指定项取当前全局默认的快照
+            int graceDays = customGracePeriodDays != null
+                    ? customGracePeriodDays : properties.getGracePeriodDays();
+            BigDecimal penaltyRate = customPenaltyDailyRate != null
+                    ? customPenaltyDailyRate.setScale(8, RoundingMode.HALF_UP)
+                    : properties.getPenaltyDailyRate().setScale(8, RoundingMode.HALF_UP);
+            LoanRules rules = new LoanRules(graceDays, penaltyRate,
+                    customGracePeriodDays != null, customPenaltyDailyRate != null);
+
             BigDecimal fee = monthlyFee != null ? monthlyFee : properties.getDefaultMonthlyFee();
             Loan loan = new Loan(loanId, principal.setScale(2, RoundingMode.HALF_UP),
                     annualRate, termMonths, disbursementDate,
-                    fee.setScale(2, RoundingMode.HALF_UP));
+                    fee.setScale(2, RoundingMode.HALF_UP), rules);
             loan.getSchedule().addAll(calculator.generateSchedule(
                     loan.getPrincipal(), annualRate, termMonths, disbursementDate, loan.getMonthlyFee()));
             loans.put(loanId, loan);
@@ -146,11 +190,26 @@ public class LoanLedgerService {
             BigDecimal payoffAmount = loan.getOutstandingPrincipal().add(dueCharges);
 
             Payment payment = applyPayoffPayment(loan, idempotencyKey, payoffAmount, valueDate);
-            // 结清后关闭所有未到期期次（利息/费用豁免，不再产生新的应还）
+            // 结清后关闭所有期次：剩余未收的利息/费用/罚息逐期逐项按减免处理，
+            // 本金已由结清款全额冲抵（不减免本金），保证各期未偿合计为 0
             for (Installment inst : loan.getSchedule()) {
-                if (inst.getStatus() != InstallmentStatus.PAID) {
-                    inst.setStatus(InstallmentStatus.PAID);
+                BigDecimal wInterest = inst.remainingInterest();
+                BigDecimal wFee = inst.remainingFee();
+                BigDecimal wPenalty = inst.remainingPenalty();
+                if (wInterest.signum() > 0 || wFee.signum() > 0 || wPenalty.signum() > 0) {
+                    if (wInterest.signum() > 0) {
+                        inst.addInterestWaived(wInterest);
+                    }
+                    if (wFee.signum() > 0) {
+                        inst.addFeeWaived(wFee);
+                    }
+                    if (wPenalty.signum() > 0) {
+                        inst.addPenaltyWaived(wPenalty);
+                    }
+                    loan.getWaivers().add(new WaiverEntry(payment.paymentId(), inst.getPeriod(),
+                            valueDate, wInterest, wFee, wPenalty));
                 }
+                inst.setStatus(InstallmentStatus.PAID);
             }
             loan.setStatus(LoanStatus.SETTLED);
             checkInvariants(loan);
@@ -175,6 +234,36 @@ public class LoanLedgerService {
     /** 全部贷款（只读视图用）。 */
     public List<Loan> listLoans() {
         return List.copyOf(loans.values());
+    }
+
+    /**
+     * 按结算日导出单笔贷款的对账结果（账本自身现金口径）。
+     *
+     * <p>结算口径：先在锁内把逾期/罚息幂等推进到 asOfDate（同结算日重复或乱序补跑
+     * 都不重复计提），再基于账本状态出报告。
+     */
+    public ReconciliationReport reconcile(String loanId, LocalDate asOfDate) {
+        return reconcile(loanId, asOfDate, null);
+    }
+
+    /**
+     * 按结算日导出对账结果；externalCashReceived 非 null 时以外部现金系统口径对比，
+     * 用于把现金侧对不上的差额直接指出来。
+     */
+    public ReconciliationReport reconcile(String loanId, LocalDate asOfDate,
+                                          BigDecimal externalCashReceived) {
+        if (asOfDate == null) {
+            throw new LedgerException(LedgerErrorCode.INVALID_AMOUNT, "结算日不能为空");
+        }
+        Object lock = lockOf(loanId);
+        synchronized (lock) {
+            Loan loan = getLoan(loanId);
+            if (loan.getStatus() != LoanStatus.SETTLED) {
+                accrueOverdueLocked(loan, asOfDate);
+                checkInvariants(loan);
+            }
+            return reconciler.build(loan, asOfDate, externalCashReceived);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -227,8 +316,10 @@ public class LoanLedgerService {
      * 累计区间 (penaltyAccruedThrough, asOfDate]，已计部分不重复计。
      */
     private void accrueOverdueLocked(Loan loan, LocalDate asOfDate) {
+        // 逾期口径取放款时固化在贷款上的规则，全局默认后续变化不影响本贷款
+        LoanRules rules = loan.getRules();
         for (Installment inst : loan.getSchedule()) {
-            LocalDate graceEnd = inst.getDueDate().plusDays(properties.getGracePeriodDays());
+            LocalDate graceEnd = inst.getDueDate().plusDays(rules.getGracePeriodDays());
             boolean fullyPaid = inst.totalRemaining().signum() == 0;
             if (fullyPaid) {
                 inst.setStatus(InstallmentStatus.PAID);
@@ -242,7 +333,7 @@ public class LoanLedgerService {
                 if (asOfDate.isAfter(from)) {
                     long days = ChronoUnit.DAYS.between(from, asOfDate);
                     BigDecimal increment = inst.penaltyBase()
-                            .multiply(properties.getPenaltyDailyRate())
+                            .multiply(rules.getPenaltyDailyRate())
                             .multiply(BigDecimal.valueOf(days))
                             .setScale(2, RoundingMode.HALF_UP);
                     if (increment.signum() > 0) {
@@ -405,6 +496,23 @@ public class LoanLedgerService {
                 throw new IllegalStateException("出现负数余额: loan=" + loan.getLoanId()
                         + ", period=" + inst.getPeriod());
             }
+            // 应收侧守恒：应收 == 已冲抵 + 未偿 + 减免（逐期逐科目）
+            assertComponentConserved(loan, inst, "PRINCIPAL",
+                    inst.getPrincipalDue(), inst.getPrincipalPaid(),
+                    inst.remainingPrincipal(), BigDecimal.ZERO.setScale(2));
+            assertComponentConserved(loan, inst, "INTEREST",
+                    inst.getInterestDue(), inst.getInterestPaid(),
+                    inst.remainingInterest(), inst.getInterestWaived());
+            assertComponentConserved(loan, inst, "FEE",
+                    inst.getFeeDue(), inst.getFeePaid(),
+                    inst.remainingFee(), inst.getFeeWaived());
+            assertComponentConserved(loan, inst, "PENALTY",
+                    inst.getPenaltyAccrued(), inst.getPenaltyPaid(),
+                    inst.remainingPenalty(), inst.getPenaltyWaived());
+            if (loan.getStatus() == LoanStatus.SETTLED && inst.totalRemaining().signum() != 0) {
+                throw new IllegalStateException("已结清贷款存在未偿: loan=" + loan.getLoanId()
+                        + ", period=" + inst.getPeriod() + ", remaining=" + inst.totalRemaining());
+            }
         }
         if (loan.getStatus() == LoanStatus.ACTIVE
                 && loan.getOutstandingPrincipal().compareTo(principalRemaining) != 0) {
@@ -412,11 +520,28 @@ public class LoanLedgerService {
                     + ", outstanding=" + loan.getOutstandingPrincipal()
                     + ", scheduleRemaining=" + principalRemaining);
         }
+        if (loan.getStatus() == LoanStatus.SETTLED
+                && loan.getOutstandingPrincipal().signum() != 0) {
+            throw new IllegalStateException("已结清贷款本金余额非零: loan=" + loan.getLoanId()
+                    + ", outstanding=" + loan.getOutstandingPrincipal());
+        }
         BigDecimal paidTotal = loan.getPayments().stream()
                 .map(Payment::amount).reduce(BigDecimal.ZERO, BigDecimal::add);
         if (paidTotal.compareTo(appliedTotal) != 0) {
             throw new IllegalStateException("账本不守恒: loan=" + loan.getLoanId()
                     + ", paid=" + paidTotal + ", applied=" + appliedTotal);
+        }
+    }
+
+    private void assertComponentConserved(Loan loan, Installment inst, String component,
+                                          BigDecimal due, BigDecimal paid,
+                                          BigDecimal outstanding, BigDecimal waived) {
+        BigDecimal rhs = paid.add(outstanding).add(waived);
+        if (due.compareTo(rhs) != 0) {
+            throw new IllegalStateException("应收侧不守恒: loan=" + loan.getLoanId()
+                    + ", period=" + inst.getPeriod() + ", component=" + component
+                    + ", due=" + due + ", paid=" + paid
+                    + ", outstanding=" + outstanding + ", waived=" + waived);
         }
     }
 }

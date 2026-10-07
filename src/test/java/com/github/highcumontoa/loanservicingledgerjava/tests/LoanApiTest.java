@@ -82,4 +82,46 @@ class LoanApiTest {
                 .andExpect(jsonPath("$.code").value("CONCURRENT_CONFLICT"));
         log.info("[判定依据] INVALID_AMOUNT / LOAN_NOT_FOUND / CONCURRENT_CONFLICT 在 API 层可区分");
     }
+
+    @Test
+    @Order(4)
+    void disburseWithCustomRulesAndReconcileViaApi() throws Exception {
+        // 放款时单笔指定宽限期/罚息日利率；留空字段则沿用全局默认
+        String body = """
+                {"loanId":"API-L2","principal":1200,"annualRate":0.12,
+                 "termMonths":12,"disbursementDate":"2026-01-01","monthlyFee":0,
+                 "gracePeriodDays":1,"penaltyDailyRate":0.001}
+                """;
+        log.info("[输入] POST /loans 单笔规则 宽限=1 罚息日利率=0.001");
+        mvc.perform(post("/loans").contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.rules.gracePeriodDays").value(1))
+                .andExpect(jsonPath("$.rules.penaltyDailyRate").value(0.001))
+                .andExpect(jsonPath("$.rules.customGracePeriod").value(true))
+                .andExpect(jsonPath("$.rules.customPenaltyRate").value(true))
+                .andExpect(jsonPath("$.waivers.length()").value(0));
+
+        // 对账入口：平衡时 balanced=true、无 discrepancies
+        mvc.perform(get("/loans/API-L2/reconciliation").param("asOfDate", "2026-01-20"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.balanced").value(true))
+                .andExpect(jsonPath("$.receivablesBalanced").value(true))
+                .andExpect(jsonPath("$.cashBalanced").value(true))
+                .andExpect(jsonPath("$.discrepancies.length()").value(0))
+                .andExpect(jsonPath("$.components.length()").value(4));
+
+        // 传入外部现金口径 cashReceived=0（实际有入账0，也是0；这里改为对已还款贷款做不平验证）
+        // 先还款，再用偏小的外部现金触发现金侧不平
+        mvc.perform(post("/loans/API-L2/payments").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"idempotencyKey\":\"API-RK1\",\"amount\":100,\"valueDate\":\"2026-01-15\"}"))
+                .andExpect(status().isOk());
+        mvc.perform(get("/loans/API-L2/reconciliation")
+                        .param("asOfDate", "2026-02-10").param("cashReceived", "90.00"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.balanced").value(false))
+                .andExpect(jsonPath("$.cashBalanced").value(false))
+                .andExpect(jsonPath("$.discrepancies[0].side").value("CASH"))
+                .andExpect(jsonPath("$.discrepancies[0].difference").value(-10.00));
+        log.info("[判定依据] 单笔规则随放款固化返回; 对账平/不平可区分, 现金差额被定位到 side=CASH, 差-10.00");
+    }
 }
