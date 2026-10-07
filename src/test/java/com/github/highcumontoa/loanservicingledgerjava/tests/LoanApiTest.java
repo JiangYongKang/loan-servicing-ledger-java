@@ -82,4 +82,33 @@ class LoanApiTest {
                 .andExpect(jsonPath("$.code").value("CONCURRENT_CONFLICT"));
         log.info("[判定依据] INVALID_AMOUNT / LOAN_NOT_FOUND / CONCURRENT_CONFLICT 在 API 层可区分");
     }
+
+    @Test
+    @Order(4)
+    void reconcileViaApi() throws Exception {
+        mvc.perform(get("/loans/API-L1/reconciliation").param("asOf", "2026-01-20"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.balanced").value(true))
+                .andExpect(jsonPath("$.subjects.length()").value(4))
+                .andExpect(jsonPath("$.cash.cashReceived").value(500.00))
+                .andExpect(jsonPath("$.cash.totalApplied").value(500.00))
+                .andExpect(jsonPath("$.discrepancies.length()").value(0));
+        log.info("[判定依据] 对账入口: 应收=已还+未偿+减免 且 现金=已冲抵 -> balanced=true");
+    }
+
+    @Test
+    @Order(5)
+    void disburseWithPerLoanRulesViaApi() throws Exception {
+        String body = """
+                {"loanId":"API-L2","principal":1000,"annualRate":0.12,
+                 "termMonths":6,"disbursementDate":"2026-01-01",
+                 "gracePeriodDays":10,"penaltyDailyRate":0.001}
+                """;
+        log.info("[输入] POST /loans {}", body.replaceAll("\\s+", ""));
+        mvc.perform(post("/loans").contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.gracePeriodDays").value(10))
+                .andExpect(jsonPath("$.penaltyDailyRate").value(0.001));
+        log.info("[判定依据] 放款时单笔指定宽限/罚息利率, 视图中固化可见");
+    }
 }

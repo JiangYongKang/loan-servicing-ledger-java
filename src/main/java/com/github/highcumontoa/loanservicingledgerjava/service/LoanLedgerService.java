@@ -5,8 +5,10 @@ import com.github.highcumontoa.loanservicingledgerjava.domain.Installment;
 import com.github.highcumontoa.loanservicingledgerjava.domain.InstallmentStatus;
 import com.github.highcumontoa.loanservicingledgerjava.domain.Loan;
 import com.github.highcumontoa.loanservicingledgerjava.domain.LoanStatus;
+import com.github.highcumontoa.loanservicingledgerjava.domain.OverdueRules;
 import com.github.highcumontoa.loanservicingledgerjava.domain.Payment;
 import com.github.highcumontoa.loanservicingledgerjava.domain.PaymentAllocation;
+import com.github.highcumontoa.loanservicingledgerjava.domain.ReconciliationReport;
 import com.github.highcumontoa.loanservicingledgerjava.error.LedgerErrorCode;
 import com.github.highcumontoa.loanservicingledgerjava.error.LedgerException;
 import java.math.BigDecimal;
@@ -49,9 +51,22 @@ public class LoanLedgerService {
         this.properties = properties;
     }
 
-    /** 发放贷款并生成摊销计划。 */
+    /** 发放贷款并生成摊销计划（逾期口径沿用放款当时的全局默认）。 */
     public Loan disburse(String loanId, BigDecimal principal, BigDecimal annualRate,
                          int termMonths, LocalDate disbursementDate, BigDecimal monthlyFee) {
+        return disburse(loanId, principal, annualRate, termMonths, disbursementDate,
+                monthlyFee, null, null);
+    }
+
+    /**
+     * 发放贷款并生成摊销计划，可为该笔贷款单独指定逾期口径。
+     *
+     * <p>gracePeriodDays / penaltyDailyRate 传 null 时取放款当时的全局默认；
+     * 无论取值来源，规则在放款时固化到贷款上，之后全局默认的调整不影响本笔贷款。
+     */
+    public Loan disburse(String loanId, BigDecimal principal, BigDecimal annualRate,
+                         int termMonths, LocalDate disbursementDate, BigDecimal monthlyFee,
+                         Integer gracePeriodDays, BigDecimal penaltyDailyRate) {
         if (loanId == null || loanId.isBlank()
                 || principal == null || principal.signum() <= 0
                 || annualRate == null || annualRate.signum() < 0
@@ -60,6 +75,14 @@ public class LoanLedgerService {
                     "非法放款参数: loanId=" + loanId + ", principal=" + principal
                             + ", annualRate=" + annualRate + ", termMonths=" + termMonths);
         }
+        if (gracePeriodDays != null && gracePeriodDays < 0) {
+            throw new LedgerException(LedgerErrorCode.INVALID_DISBURSEMENT,
+                    "宽限期天数不能为负: " + gracePeriodDays);
+        }
+        if (penaltyDailyRate != null && penaltyDailyRate.signum() < 0) {
+            throw new LedgerException(LedgerErrorCode.INVALID_DISBURSEMENT,
+                    "罚息日利率不能为负: " + penaltyDailyRate);
+        }
         Object lock = locks.computeIfAbsent(loanId, k -> new Object());
         synchronized (lock) {
             if (loans.containsKey(loanId)) {
@@ -67,9 +90,13 @@ public class LoanLedgerService {
                         "贷款已存在: " + loanId);
             }
             BigDecimal fee = monthlyFee != null ? monthlyFee : properties.getDefaultMonthlyFee();
+            // 规则固化：单笔指定优先，否则快照放款当时的全局默认
+            OverdueRules rules = new OverdueRules(
+                    gracePeriodDays != null ? gracePeriodDays : properties.getGracePeriodDays(),
+                    penaltyDailyRate != null ? penaltyDailyRate : properties.getPenaltyDailyRate());
             Loan loan = new Loan(loanId, principal.setScale(2, RoundingMode.HALF_UP),
                     annualRate, termMonths, disbursementDate,
-                    fee.setScale(2, RoundingMode.HALF_UP));
+                    fee.setScale(2, RoundingMode.HALF_UP), rules);
             loan.getSchedule().addAll(calculator.generateSchedule(
                     loan.getPrincipal(), annualRate, termMonths, disbursementDate, loan.getMonthlyFee()));
             loans.put(loanId, loan);
@@ -146,8 +173,13 @@ public class LoanLedgerService {
             BigDecimal payoffAmount = loan.getOutstandingPrincipal().add(dueCharges);
 
             Payment payment = applyPayoffPayment(loan, idempotencyKey, payoffAmount, valueDate);
-            // 结清后关闭所有未到期期次（利息/费用豁免，不再产生新的应还）
+            // 结清减免：未到期期次尚未收取的利息与费用逐期逐项记为减免，
+            // 记录后各期未偿归零，不再产生新的应还
             for (Installment inst : loan.getSchedule()) {
+                if (inst.getDueDate().isAfter(valueDate)) {
+                    inst.addInterestWaived(inst.remainingInterest());
+                    inst.addFeeWaived(inst.remainingFee());
+                }
                 if (inst.getStatus() != InstallmentStatus.PAID) {
                     inst.setStatus(InstallmentStatus.PAID);
                 }
@@ -175,6 +207,86 @@ public class LoanLedgerService {
     /** 全部贷款（只读视图用）。 */
     public List<Loan> listLoans() {
         return List.copyOf(loans.values());
+    }
+
+    /**
+     * 按结算日导出对账结果：先按 asOfDate 推进逾期/罚息（幂等），再核对两条平衡式。
+     *
+     * <p>平衡式一（按科目）：历期应收合计 = 已还 + 未偿 + 减免；
+     * 平衡式二（现金侧）：实际入账现金合计 = 已冲抵合计。
+     * 任何一处不平，都会在 discrepancies 中指明科目与差额。
+     */
+    public ReconciliationReport reconcile(String loanId, LocalDate asOfDate) {
+        if (asOfDate == null) {
+            throw new LedgerException(LedgerErrorCode.INVALID_AMOUNT, "结算日不能为空");
+        }
+        Object lock = lockOf(loanId);
+        synchronized (lock) {
+            Loan loan = getLoan(loanId);
+            if (loan.getStatus() != LoanStatus.SETTLED) {
+                accrueOverdueLocked(loan, asOfDate);
+            }
+
+            BigDecimal billedPrincipal = BigDecimal.ZERO, billedInterest = BigDecimal.ZERO;
+            BigDecimal billedFee = BigDecimal.ZERO, billedPenalty = BigDecimal.ZERO;
+            BigDecimal paidPrincipal = BigDecimal.ZERO, paidInterest = BigDecimal.ZERO;
+            BigDecimal paidFee = BigDecimal.ZERO, paidPenalty = BigDecimal.ZERO;
+            BigDecimal outInterest = BigDecimal.ZERO;
+            BigDecimal outFee = BigDecimal.ZERO, outPenalty = BigDecimal.ZERO;
+            BigDecimal waivedInterest = BigDecimal.ZERO, waivedFee = BigDecimal.ZERO;
+            for (Installment inst : loan.getSchedule()) {
+                billedPrincipal = billedPrincipal.add(inst.getPrincipalDue());
+                billedInterest = billedInterest.add(inst.getInterestDue());
+                billedFee = billedFee.add(inst.getFeeDue());
+                billedPenalty = billedPenalty.add(inst.getPenaltyAccrued());
+                paidPrincipal = paidPrincipal.add(inst.getPrincipalPaid());
+                paidInterest = paidInterest.add(inst.getInterestPaid());
+                paidFee = paidFee.add(inst.getFeePaid());
+                paidPenalty = paidPenalty.add(inst.getPenaltyPaid());
+                outInterest = outInterest.add(inst.remainingInterest());
+                outFee = outFee.add(inst.remainingFee());
+                outPenalty = outPenalty.add(inst.remainingPenalty());
+                waivedInterest = waivedInterest.add(inst.getInterestWaived());
+                waivedFee = waivedFee.add(inst.getFeeWaived());
+            }
+            BigDecimal zero = BigDecimal.ZERO.setScale(2);
+            List<ReconciliationReport.SubjectBalance> subjects = List.of(
+                    // 本金科目的未偿取账户级余额，与计划明细(应收-已还)交叉核对
+                    subject("PRINCIPAL", billedPrincipal, paidPrincipal,
+                            loan.getOutstandingPrincipal(), zero),
+                    subject("INTEREST", billedInterest, paidInterest, outInterest, waivedInterest),
+                    subject("FEE", billedFee, paidFee, outFee, waivedFee),
+                    subject("PENALTY", billedPenalty, paidPenalty, outPenalty, zero));
+
+            BigDecimal cashReceived = loan.getPayments().stream()
+                    .map(Payment::amount).reduce(BigDecimal.ZERO, BigDecimal::add);
+            BigDecimal totalApplied = paidPrincipal.add(paidInterest).add(paidFee).add(paidPenalty);
+            ReconciliationReport.CashBalance cash = new ReconciliationReport.CashBalance(
+                    cashReceived, totalApplied, cashReceived.subtract(totalApplied));
+
+            List<ReconciliationReport.Discrepancy> discrepancies = new ArrayList<>();
+            for (ReconciliationReport.SubjectBalance s : subjects) {
+                if (s.difference().signum() != 0) {
+                    discrepancies.add(new ReconciliationReport.Discrepancy(
+                            s.subject(), s.difference(),
+                            "应收(" + s.billed() + ") != 已还(" + s.paid() + ") + 未偿("
+                                    + s.outstanding() + ") + 减免(" + s.waived() + ")"));
+                }
+            }
+            if (cash.difference().signum() != 0) {
+                discrepancies.add(new ReconciliationReport.Discrepancy(
+                        "CASH", cash.difference(),
+                        "入账现金(" + cash.cashReceived() + ") != 已冲抵合计(" + cash.totalApplied() + ")"));
+            }
+            return new ReconciliationReport(loanId, asOfDate, discrepancies.isEmpty(),
+                    subjects, cash, List.copyOf(discrepancies));
+        }
+    }
+
+    private static ReconciliationReport.SubjectBalance subject(
+            String name, BigDecimal billed, BigDecimal paid, BigDecimal outstanding, BigDecimal waived) {
+        return new ReconciliationReport.SubjectBalance(name, billed, paid, outstanding, waived,
+                billed.subtract(paid).subtract(outstanding).subtract(waived));
     }
 
     // ------------------------------------------------------------------
@@ -227,8 +339,9 @@ public class LoanLedgerService {
      * 累计区间 (penaltyAccruedThrough, asOfDate]，已计部分不重复计。
      */
     private void accrueOverdueLocked(Loan loan, LocalDate asOfDate) {
+        OverdueRules rules = loan.getOverdueRules();
         for (Installment inst : loan.getSchedule()) {
-            LocalDate graceEnd = inst.getDueDate().plusDays(properties.getGracePeriodDays());
+            LocalDate graceEnd = inst.getDueDate().plusDays(rules.gracePeriodDays());
             boolean fullyPaid = inst.totalRemaining().signum() == 0;
             if (fullyPaid) {
                 inst.setStatus(InstallmentStatus.PAID);
@@ -242,7 +355,7 @@ public class LoanLedgerService {
                 if (asOfDate.isAfter(from)) {
                     long days = ChronoUnit.DAYS.between(from, asOfDate);
                     BigDecimal increment = inst.penaltyBase()
-                            .multiply(properties.getPenaltyDailyRate())
+                            .multiply(rules.penaltyDailyRate())
                             .multiply(BigDecimal.valueOf(days))
                             .setScale(2, RoundingMode.HALF_UP);
                     if (increment.signum() > 0) {
